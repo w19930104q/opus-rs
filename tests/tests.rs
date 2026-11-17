@@ -32,6 +32,9 @@ fn strings_ascii() {
 // 48000Hz * 1 channel * 20 ms / 1000 = 960
 const MONO_20MS: usize = 48000 * 20 / 1000;
 
+// Exact encoded byte output requires the real codec; the Miri framing mock
+// produces different (but still valid) packets.
+#[cfg(not(miri))]
 #[test]
 fn encode_mono() {
 	let mut encoder =
@@ -54,6 +57,7 @@ fn encode_mono() {
 	assert!(myvec.len() > 120 && myvec.len() < 140);
 }
 
+#[cfg(not(miri))]
 #[test]
 fn encode_stereo() {
 	let mut encoder =
@@ -80,6 +84,7 @@ fn encode_stereo() {
 	assert!(myvec.len() <= 20);
 }
 
+#[cfg(not(miri))]
 #[test]
 fn encode_decode_stereo() {
 	let mut opus_encoder =
@@ -106,6 +111,9 @@ fn encode_decode_stereo() {
 	assert_eq!(MONO_20MS, opus_decoder.decode(packet, &mut output, false).unwrap());
 }
 
+// The mock deliberately accepts the unusual rate rather than modeling every
+// encoder validation rule, so this negative test runs against the real codec.
+#[cfg(not(miri))]
 #[test]
 fn encode_bad_rate() {
 	match opus::Encoder::new(48001, opus::Channels::Mono, opus::Application::Audio) {
@@ -124,6 +132,8 @@ fn encode_bad_buffer() {
 	}
 }
 
+// Exact repacketized byte output requires the real codec framing.
+#[cfg(not(miri))]
 #[test]
 fn repacketizer() {
 	let mut rp = opus::Repacketizer::new().unwrap();

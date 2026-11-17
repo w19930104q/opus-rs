@@ -1,0 +1,12 @@
+error[E0597]: `packet` does not live long enough
+  --> tests/compile-fail/ui/repacketize.rs:9:23
+   |
+ 5 |     let mut wip = {
+   |         ------- borrow later stored here
+...
+ 8 |         let packet = vec![248u8, 255, 254];
+   |             ------ binding `packet` declared here
+ 9 |         rp.begin().cat_move(&packet).unwrap()
+   |                             ^^^^^^^ borrowed value does not live long enough
+10 |     };
+   |     - `packet` dropped here while still borrowed

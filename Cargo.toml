@@ -16,3 +16,6 @@ edition = "2015"
 
 [dependencies]
 opusic-sys = "0.7.3"
+
+[dev-dependencies]
+trybuild = "1.0"

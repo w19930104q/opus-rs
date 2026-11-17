@@ -11,8 +11,19 @@
 //! Only brief descriptions are included here. For detailed information, consult
 //! the [libopus documentation](https://opus-codec.org/docs/opus_api-1.5/).
 #![warn(missing_docs)]
+// Under Miri the FFI is the pure-Rust mock in ffi_miri.rs, whose functions are
+// safe, so the `unsafe` blocks around FFI calls are (correctly) redundant
+// there. They remain required against the real C library.
+#![cfg_attr(miri, allow(unused_unsafe))]
 
+#[cfg(not(miri))]
 extern crate opusic_sys as ffi;
+
+// Under Miri the real C library cannot execute, so substitute a pure-Rust
+// model exposing the same FFI surface. See `ffi_miri.rs` for what is covered.
+#[cfg(miri)]
+#[path = "ffi_miri.rs"]
+mod ffi;
 
 use std::convert::TryFrom;
 use std::ffi::CStr;
@@ -354,7 +365,9 @@ pub struct Encoder {
 
 impl Drop for Encoder {
 	fn drop(&mut self) {
-		unsafe { ffi::opus_encoder_destroy(self.ptr) }
+		if !self.ptr.is_null() {
+			unsafe { ffi::opus_encoder_destroy(self.ptr) }
+		}
 	}
 }
 
@@ -382,11 +395,8 @@ impl Encoder {
 				&mut error,
 			)
 		};
-		if error != ffi::OPUS_OK || ptr.is_null() {
-			Err(Error::from_code("opus_encoder_create", error))
-		} else {
-			Ok(Encoder { ptr, channels })
-		}
+		let ptr = check_create("opus_encoder_create", ptr, error)?;
+		Ok(Encoder { ptr, channels })
 	}
 
 	/// Encode an Opus frame.
@@ -395,9 +405,9 @@ impl Encoder {
 			opus_encode,
 			self.ptr,
 			input.as_ptr(),
-			len(input) / self.channels as c_int,
+			len(input, "opus_encode(input)")? / self.channels as c_int,
 			output.as_mut_ptr(),
-			len(output)
+			len(output, "opus_encode(output)")?
 		);
 		Ok(len as usize)
 	}
@@ -408,9 +418,9 @@ impl Encoder {
 			opus_encode_float,
 			self.ptr,
 			input.as_ptr(),
-			len(input) / self.channels as c_int,
+			len(input, "opus_encode_float(input)")? / self.channels as c_int,
 			output.as_mut_ptr(),
-			len(output)
+			len(output, "opus_encode_float(output)")?
 		);
 		Ok(len as usize)
 	}
@@ -684,7 +694,9 @@ pub struct Decoder {
 
 impl Drop for Decoder {
 	fn drop(&mut self) {
-		unsafe { ffi::opus_decoder_destroy(self.ptr) }
+		if !self.ptr.is_null() {
+			unsafe { ffi::opus_decoder_destroy(self.ptr) }
+		}
 	}
 }
 
@@ -697,11 +709,8 @@ impl Decoder {
 		let mut error = 0;
 		let ptr =
 			unsafe { ffi::opus_decoder_create(sample_rate as i32, channels as c_int, &mut error) };
-		if error != ffi::OPUS_OK || ptr.is_null() {
-			Err(Error::from_code("opus_decoder_create", error))
-		} else {
-			Ok(Decoder { ptr, channels })
-		}
+		let ptr = check_create("opus_decoder_create", ptr, error)?;
+		Ok(Decoder { ptr, channels })
 	}
 
 	/// Decode an Opus packet.
@@ -719,9 +728,9 @@ impl Decoder {
 			opus_decode,
 			self.ptr,
 			ptr,
-			len(input),
+			len(input, "opus_decode(input)")?,
 			output.as_mut_ptr(),
-			len(output) / self.channels as c_int,
+			len(output, "opus_decode(output)")? / self.channels as c_int,
 			fec as c_int
 		);
 		Ok(len as usize)
@@ -742,9 +751,9 @@ impl Decoder {
 			opus_decode_float,
 			self.ptr,
 			ptr,
-			len(input),
+			len(input, "opus_decode_float(input)")?,
 			output.as_mut_ptr(),
-			len(output) / self.channels as c_int,
+			len(output, "opus_decode_float(output)")? / self.channels as c_int,
 			fec as c_int
 		);
 		Ok(len as usize)
@@ -752,7 +761,12 @@ impl Decoder {
 
 	/// Get the number of samples *per channel* of an Opus packet.
 	pub fn get_nb_samples(&self, packet: &[u8]) -> Result<usize> {
-		let len = ffi!(opus_decoder_get_nb_samples, self.ptr, packet.as_ptr(), packet.len() as i32);
+		let len = ffi!(
+			opus_decoder_get_nb_samples,
+			self.ptr,
+			packet.as_ptr(),
+			check_len(packet.len(), "opus_decoder_get_nb_samples(len)")?
+		);
 		Ok(len as usize)
 	}
 }
@@ -840,14 +854,22 @@ pub mod packet {
 
 	/// Get the number of frames in an Opus packet.
 	pub fn get_nb_frames(packet: &[u8]) -> Result<usize> {
-		let frames = ffi!(opus_packet_get_nb_frames, packet.as_ptr(), len(packet));
+		let frames = ffi!(
+			opus_packet_get_nb_frames,
+			packet.as_ptr(),
+			len(packet, "opus_packet_get_nb_frames(len)")?
+		);
 		Ok(frames as usize)
 	}
 
 	/// Get the number of samples of an Opus packet.
 	pub fn get_nb_samples(packet: &[u8], sample_rate: u32) -> Result<usize> {
-		let frames =
-			ffi!(opus_packet_get_nb_samples, packet.as_ptr(), len(packet), sample_rate as c_int);
+		let frames = ffi!(
+			opus_packet_get_nb_samples,
+			packet.as_ptr(),
+			len(packet, "opus_packet_get_nb_samples(len)")?,
+			sample_rate as c_int
+		);
 		Ok(frames as usize)
 	}
 
@@ -870,23 +892,55 @@ pub mod packet {
 		let num_frames = ffi!(
 			opus_packet_parse,
 			packet.as_ptr(),
-			len(packet),
+			len(packet, "opus_packet_parse(len)")?,
 			&mut toc,
 			frames.as_mut_ptr(),
 			sizes.as_mut_ptr(),
 			&mut payload_offset
 		);
 
-		let mut frames_vec = Vec::with_capacity(num_frames as usize);
-		for i in 0..num_frames as usize {
-			frames_vec.push(unsafe { slice::from_raw_parts(frames[i], sizes[i] as usize) });
+		// `num_frames` is non-negative here because negative return values are
+		// turned into errors by the `ffi!` macro, and libopus documents a
+		// maximum of 48 frames. Treat every value outside that range as a
+		// corrupted packet rather than indexing the fixed-size arrays with it.
+		let num_frames = match usize::try_from(num_frames) {
+			Ok(nf) if nf <= frames.len() => nf,
+			_ => return Err(Error::from_code("opus_packet_parse", ffi::OPUS_INVALID_PACKET)),
+		};
+		// The payload offset must point inside the packet.
+		let payload_offset = match usize::try_from(payload_offset) {
+			Ok(offset) if offset <= packet.len() => offset,
+			_ => return Err(Error::from_code("opus_packet_parse", ffi::OPUS_INVALID_PACKET)),
+		};
+
+		// The frame pointers and sizes come from the untrusted decoder, so do
+		// not trust them blindly: verify that every frame is a non-empty slice
+		// fully contained in the input packet before constructing a Rust
+		// reference to its memory.
+		let packet_base = packet.as_ptr();
+		let packet_end = packet_base.wrapping_add(packet.len());
+		let mut frames_vec = Vec::with_capacity(num_frames);
+		for i in 0..num_frames {
+			let frame_ptr = frames[i];
+			let size = match usize::try_from(sizes[i]) {
+				Ok(size) if size > 0 => size,
+				_ => return Err(Error::from_code("opus_packet_parse", ffi::OPUS_INVALID_PACKET)),
+			};
+			if frame_ptr.is_null() {
+				return Err(Error::from_code("opus_packet_parse", ffi::OPUS_INVALID_PACKET));
+			}
+			let frame_end = frame_ptr.wrapping_add(size);
+			let in_bounds = frame_ptr >= packet_base
+				&& frame_end <= packet_end
+				&& !frame_end.is_null()
+				&& frame_end >= frame_ptr;
+			if !in_bounds {
+				return Err(Error::from_code("opus_packet_parse", ffi::OPUS_INVALID_PACKET));
+			}
+			frames_vec.push(unsafe { slice::from_raw_parts(frame_ptr, size) });
 		}
 
-		Ok(Packet {
-			toc,
-			frames: frames_vec,
-			payload_offset: payload_offset as usize,
-		})
+		Ok(Packet { toc, frames: frames_vec, payload_offset })
 	}
 
 	/// A parsed Opus packet, retuned from `parse`.
@@ -904,15 +958,26 @@ pub mod packet {
 	///
 	/// The packet will be extended from the first `prev_len` bytes of the
 	/// buffer into the rest of the available space.
+	///
+	/// On success the returned value is the new packet length, which equals
+	/// `packet.len()`. Note that the underlying `opus_packet_pad` only returns
+	/// a status code (`OPUS_OK`); the length comes from the buffer itself.
 	pub fn pad(packet: &mut [u8], prev_len: usize) -> Result<usize> {
-		let result = ffi!(opus_packet_pad, packet.as_mut_ptr(), check_len(prev_len), len(packet));
-		Ok(result as usize)
+		let new_len = len(packet, "opus_packet_pad(new_len)")?;
+		ffi!(
+			opus_packet_pad,
+			packet.as_mut_ptr(),
+			check_len(prev_len, "opus_packet_pad(prev_len)")?,
+			new_len
+		);
+		Ok(new_len as usize)
 	}
 
 	/// Remove all padding from a given Opus packet and rewrite the TOC sequence
 	/// to minimize space usage.
 	pub fn unpad(packet: &mut [u8]) -> Result<usize> {
-		let result = ffi!(opus_packet_unpad, packet.as_mut_ptr(), len(packet));
+		let result =
+			ffi!(opus_packet_unpad, packet.as_mut_ptr(), len(packet, "opus_packet_unpad(len)")?);
 		Ok(result as usize)
 	}
 
@@ -920,15 +985,19 @@ pub mod packet {
 	///
 	/// The packet will be extended from the first `prev_len` bytes of the
 	/// buffer into the rest of the available space.
+	///
+	/// On success the returned value is the new packet length, which equals
+	/// `packet.len()`; the underlying function only returns a status code.
 	pub fn multistream_pad(packet: &mut [u8], prev_len: usize, nb_streams: u8) -> Result<usize> {
-		let result = ffi!(
+		let new_len = len(packet, "opus_multistream_packet_pad(new_len)")?;
+		ffi!(
 			opus_multistream_packet_pad,
 			packet.as_mut_ptr(),
-			check_len(prev_len),
-			len(packet),
+			check_len(prev_len, "opus_multistream_packet_pad(prev_len)")?,
+			new_len,
 			nb_streams as c_int
 		);
-		Ok(result as usize)
+		Ok(new_len as usize)
 	}
 
 	/// Remove all padding from a given Opus multi-stream packet and rewrite
@@ -937,7 +1006,7 @@ pub mod packet {
 		let result = ffi!(
 			opus_multistream_packet_unpad,
 			packet.as_mut_ptr(),
-			len(packet),
+			len(packet, "opus_multistream_packet_unpad(len)")?,
 			nb_streams as c_int
 		);
 		Ok(result as usize)
@@ -962,14 +1031,36 @@ impl SoftClip {
 
 	/// Apply soft-clipping to a float signal.
 	pub fn apply(&mut self, signal: &mut [f32]) {
-		unsafe {
-			ffi::opus_pcm_soft_clip(
-				signal.as_mut_ptr(),
-				len(signal) / self.channels as c_int,
-				self.channels as c_int,
-				self.memory.as_mut_ptr(),
-			)
-		};
+		// libopus takes the frame size as a `c_int`; process the signal in
+		// chunks so that arbitrarily large (or empty) slices never overflow
+		// the conversion. Each chunk covers whole frames (a multiple of the
+		// channel count), preserving the exact per-channel state semantics.
+		let channels = self.channels as usize;
+		if channels == 0 {
+			return;
+		}
+		let max_frames = c_int::MAX as usize;
+		let mut rest = signal;
+		while !rest.is_empty() {
+			let frames = rest.len() / channels;
+			let take_frames = frames.min(max_frames);
+			// When the slice holds less than one frame there is nothing that
+			// can be processed; mirror the truncated behavior and stop.
+			if take_frames == 0 {
+				break;
+			}
+			let take = take_frames * channels;
+			let (chunk, tail) = rest.split_at_mut(take);
+			unsafe {
+				ffi::opus_pcm_soft_clip(
+					chunk.as_mut_ptr(),
+					take_frames as c_int,
+					self.channels as c_int,
+					self.memory.as_mut_ptr(),
+				)
+			};
+			rest = tail;
+		}
 	}
 }
 
@@ -984,7 +1075,9 @@ pub struct Repacketizer {
 
 impl Drop for Repacketizer {
 	fn drop(&mut self) {
-		unsafe { ffi::opus_repacketizer_destroy(self.ptr) }
+		if !self.ptr.is_null() {
+			unsafe { ffi::opus_repacketizer_destroy(self.ptr) }
+		}
 	}
 }
 
@@ -995,11 +1088,10 @@ impl Repacketizer {
 	/// Create and initialize a repacketizer.
 	pub fn new() -> Result<Repacketizer> {
 		let ptr = unsafe { ffi::opus_repacketizer_create() };
-		if ptr.is_null() {
-			Err(Error::from_code("opus_repacketizer_create", ffi::OPUS_ALLOC_FAIL))
-		} else {
-			Ok(Repacketizer { ptr })
-		}
+		// `opus_repacketizer_create` has no error-code out-parameter, so pass
+		// `OPUS_OK`; a null pointer is mapped to `AllocFail` by `check_create`.
+		let ptr = check_create("opus_repacketizer_create", ptr, ffi::OPUS_OK)?;
+		Ok(Repacketizer { ptr })
 	}
 
 	/// Shortcut to combine several smaller packets into one larger one.
@@ -1014,6 +1106,10 @@ impl Repacketizer {
 	/// Begin using the repacketizer.
 	#[allow(clippy::needless_lifetimes)]
 	pub fn begin<'rp, 'buf>(&'rp mut self) -> RepacketizerState<'rp, 'buf> {
+		// `opus_repacketizer_init` returns the same pointer it is given; the
+		// pointer is non-null because `new()` validates it, but keep the
+		// assertion explicit so a null handle can never reach the FFI calls.
+		debug_assert!(!self.ptr.is_null());
 		unsafe {
 			ffi::opus_repacketizer_init(self.ptr);
 		}
@@ -1040,7 +1136,12 @@ unsafe impl<'rp, 'buf> Send for RepacketizerState<'rp, 'buf> {}
 impl<'rp, 'buf> RepacketizerState<'rp, 'buf> {
 	/// Add a packet to the current repacketizer state.
 	pub fn cat(&mut self, packet: &'buf [u8]) -> Result<()> {
-		ffi!(opus_repacketizer_cat, self.ptr, packet.as_ptr(), len(packet));
+		ffi!(
+			opus_repacketizer_cat,
+			self.ptr,
+			packet.as_ptr(),
+			len(packet, "opus_repacketizer_cat(len)")?
+		);
 		Ok(())
 	}
 
@@ -1065,7 +1166,12 @@ impl<'rp, 'buf> RepacketizerState<'rp, 'buf> {
 	///
 	/// All previously submitted frames are used.
 	pub fn out(&mut self, buffer: &mut [u8]) -> Result<usize> {
-		let result = ffi!(opus_repacketizer_out, self.ptr, buffer.as_mut_ptr(), len(buffer));
+		let result = ffi!(
+			opus_repacketizer_out,
+			self.ptr,
+			buffer.as_mut_ptr(),
+			len(buffer, "opus_repacketizer_out(maxlen)")?
+		);
 		Ok(result as usize)
 	}
 
@@ -1077,10 +1183,10 @@ impl<'rp, 'buf> RepacketizerState<'rp, 'buf> {
 		let result = ffi!(
 			opus_repacketizer_out_range,
 			self.ptr,
-			check_len(begin),
-			check_len(end),
+			check_len(begin, "opus_repacketizer_out_range(begin)")?,
+			check_len(end, "opus_repacketizer_out_range(end)")?,
 			buffer.as_mut_ptr(),
-			len(buffer)
+			len(buffer, "opus_repacketizer_out_range(maxlen)")?
 		);
 		Ok(result as usize)
 	}
@@ -1100,7 +1206,9 @@ pub struct MSEncoder {
 
 impl Drop for MSEncoder {
 	fn drop(&mut self) {
-		unsafe { ffi::opus_multistream_encoder_destroy(self.ptr) }
+		if !self.ptr.is_null() {
+			unsafe { ffi::opus_multistream_encoder_destroy(self.ptr) }
+		}
 	}
 }
 
@@ -1120,7 +1228,7 @@ impl MSEncoder {
 		let ptr = unsafe {
 			ffi::opus_multistream_encoder_create(
 				sample_rate as i32,
-				len(mapping),
+				len(mapping, "opus_multistream_encoder_create(mapping)")?,
 				streams as c_int,
 				coupled_streams as c_int,
 				mapping.as_ptr(),
@@ -1128,11 +1236,11 @@ impl MSEncoder {
 				&mut error,
 			)
 		};
-		if error != ffi::OPUS_OK || ptr.is_null() {
-			Err(Error::from_code("opus_multistream_encoder_create", error))
-		} else {
-			Ok(MSEncoder { ptr, channels: len(mapping) })
-		}
+		let ptr = check_create("opus_multistream_encoder_create", ptr, error)?;
+		Ok(MSEncoder {
+			ptr,
+			channels: len(mapping, "opus_multistream_encoder_create(mapping)")?,
+		})
 	}
 
 	// TODO: new_surround -> opus_multistream_encoder_create, but it's missing
@@ -1144,9 +1252,9 @@ impl MSEncoder {
 			opus_multistream_encode,
 			self.ptr,
 			input.as_ptr(),
-			len(input) / self.channels as c_int,
+			len(input, "opus_multistream_encode(input)")? / self.channels as c_int,
 			output.as_mut_ptr(),
-			len(output)
+			len(output, "opus_multistream_encode(output)")?
 		);
 		Ok(len as usize)
 	}
@@ -1157,9 +1265,9 @@ impl MSEncoder {
 			opus_multistream_encode_float,
 			self.ptr,
 			input.as_ptr(),
-			len(input) / self.channels as c_int,
+			len(input, "opus_multistream_encode_float(input)")? / self.channels as c_int,
 			output.as_mut_ptr(),
-			len(output)
+			len(output, "opus_multistream_encode_float(output)")?
 		);
 		Ok(len as usize)
 	}
@@ -1195,7 +1303,9 @@ pub struct MSDecoder {
 
 impl Drop for MSDecoder {
 	fn drop(&mut self) {
-		unsafe { ffi::opus_multistream_decoder_destroy(self.ptr) }
+		if !self.ptr.is_null() {
+			unsafe { ffi::opus_multistream_decoder_destroy(self.ptr) }
+		}
 	}
 }
 
@@ -1214,18 +1324,18 @@ impl MSDecoder {
 		let ptr = unsafe {
 			ffi::opus_multistream_decoder_create(
 				sample_rate as i32,
-				len(mapping),
+				len(mapping, "opus_multistream_decoder_create(mapping)")?,
 				streams as c_int,
 				coupled_streams as c_int,
 				mapping.as_ptr(),
 				&mut error,
 			)
 		};
-		if error != ffi::OPUS_OK || ptr.is_null() {
-			Err(Error::from_code("opus_multistream_decoder_create", error))
-		} else {
-			Ok(MSDecoder { ptr, channels: len(mapping) })
-		}
+		let ptr = check_create("opus_multistream_decoder_create", ptr, error)?;
+		Ok(MSDecoder {
+			ptr,
+			channels: len(mapping, "opus_multistream_decoder_create(mapping)")?,
+		})
 	}
 
 	/// Decode a multistream Opus packet.
@@ -1240,9 +1350,9 @@ impl MSDecoder {
 			opus_multistream_decode,
 			self.ptr,
 			ptr,
-			len(input),
+			len(input, "opus_multistream_decode(input)")?,
 			output.as_mut_ptr(),
-			len(output) / self.channels as c_int,
+			len(output, "opus_multistream_decode(output)")? / self.channels as c_int,
 			fec as c_int
 		);
 		Ok(len as usize)
@@ -1258,9 +1368,9 @@ impl MSDecoder {
 			opus_multistream_decode_float,
 			self.ptr,
 			ptr,
-			len(input),
+			len(input, "opus_multistream_decode_float(input)")?,
 			output.as_mut_ptr(),
-			len(output) / self.channels as c_int,
+			len(output, "opus_multistream_decode_float(output)")? / self.channels as c_int,
 			fec as c_int
 		);
 		Ok(len as usize)
@@ -1326,14 +1436,46 @@ impl std::error::Error for Error {
 	}
 }
 
-fn check_len(val: usize) -> c_int {
+/// Convert an untrusted length into the `c_int` range expected by libopus,
+/// mapping out-of-range values to `BadArg` instead of panicking.
+///
+/// Every length that originates outside this crate (slice lengths, caller-
+/// supplied indices such as `prev_len`, `begin`, and `end`) must pass through
+/// one of these helpers before being handed to the FFI layer.
+fn check_len(val: usize, what: &'static str) -> Result<c_int> {
 	match c_int::try_from(val) {
-		Ok(val2) => val2,
-		Err(_) => panic!("length out of range: {}", val),
+		Ok(val) => Ok(val),
+		Err(_) => Err(Error::bad_arg(what)),
 	}
 }
 
+/// Convert the length of an untrusted slice into the `c_int` range expected
+/// by libopus.
 #[inline]
-fn len<T>(slice: &[T]) -> c_int {
-	check_len(slice.len())
+fn len<T>(slice: &[T], what: &'static str) -> Result<c_int> {
+	check_len(slice.len(), what)
+}
+
+/// Validate the result of a libopus `*_create` function.
+///
+/// A libopus constructor reports failure either through its error-code
+/// out-parameter or by returning a null pointer. Centralizing the check makes
+/// sure no wrapper can construct a handle that owns a null pointer (which
+/// would later be passed to `*_destroy`), and keeps the error mapping
+/// identical across all five handle types.
+fn check_create<T>(what: &'static str, ptr: *mut T, error: c_int) -> Result<*mut T> {
+	if ptr.is_null() {
+		// The library returned a null pointer. Prefer its recorded error code;
+		// when none was recorded (e.g. `opus_repacketizer_create`, which has no
+		// error out-parameter) the only documented cause is allocation failure.
+		if error == ffi::OPUS_OK {
+			Err(Error::from_code(what, ffi::OPUS_ALLOC_FAIL))
+		} else {
+			Err(Error::from_code(what, error))
+		}
+	} else if error != ffi::OPUS_OK {
+		Err(Error::from_code(what, error))
+	} else {
+		Ok(ptr)
+	}
 }

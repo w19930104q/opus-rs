@@ -1,0 +1,11 @@
+error[E0597]: `packet` does not live long enough
+ --> tests/compile-fail/ui/parse-lifetime.rs:8:23
+  |
+6 |     let parsed = {
+  |         ------ borrow later stored here
+7 |         let packet = vec![248u8, 255, 254];
+  |             ------ binding `packet` declared here
+8 |         opus::packet::parse(&packet).unwrap()
+  |                             ^^^^^^^ borrowed value does not live long enough
+9 |     };
+  |     - `packet` dropped here while still borrowed
